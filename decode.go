@@ -284,7 +284,7 @@ func (p *parser) parseChildren(event yaml_event_type_t, n *node) {
 }
 
 func (p *parser) predoc() string {
-	str := p.parser.predoc.String()
+	str := string(p.parser.predoc)
 	if p.parser.parse_comments && len(str) > 0 && str[len(str)-1] == '\n' {
 		// Remove extraneous newline
 		str = str[:len(str)-1]

@@ -3,7 +3,6 @@ package yaml
 import (
 	"fmt"
 	"io"
-	"strings"
 )
 
 // The version directive data.
@@ -598,8 +597,8 @@ type yaml_parser_t struct {
 	offset int         // The offset of the current position (in bytes).
 	mark   yaml_mark_t // The mark of the current position.
 
-	doc_started bool            // True if parsing of the document has started (after comments and directives).
-	predoc      strings.Builder // Comments and directives that take place before the yaml data.
+	doc_started bool   // True if parsing of the document has started (after comments and directives).
+	predoc      []byte // Comments and directives that take place before the yaml data.
 
 	// Scanner stuff
 

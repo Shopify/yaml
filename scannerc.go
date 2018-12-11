@@ -489,7 +489,7 @@ func cache(parser *yaml_parser_t, length int) bool {
 
 func copy_to_predoc(parser *yaml_parser_t, data ...byte) {
 	if !parser.doc_started {
-		parser.predoc.Write(data)
+		parser.predoc = append(parser.predoc, data...)
 	}
 }
 
