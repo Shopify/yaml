@@ -8,15 +8,19 @@ import (
 	"math"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 )
 
 const (
-	documentNode = 1 << iota
+	_ = iota
+	documentNode
 	mappingNode
 	sequenceNode
 	scalarNode
 	aliasNode
+	commentNode
+	eolCommentNode
 )
 
 type node struct {
@@ -39,6 +43,7 @@ type parser struct {
 	event    yaml_event_t
 	doc      *node
 	doneInit bool
+	comments []*node
 }
 
 func newParser(b []byte) *parser {
@@ -151,9 +156,13 @@ func (p *parser) parse() *node {
 		return p.sequence()
 	case yaml_DOCUMENT_START_EVENT:
 		return p.document()
+	case yaml_COMMENT_EVENT:
+		return p.comment()
+	case yaml_EOL_COMMENT_EVENT:
+		return p.eolcomment()
 	case yaml_STREAM_END_EVENT:
-		// Happens when attempting to decode an empty buffer.
-		return nil
+		// Happens when attempting to decode an empty buffer or a buffer with only comments.
+		return p.emptydocument()
 	default:
 		panic("attempted to parse unknown event: " + p.event.typ.String())
 	}
@@ -170,10 +179,26 @@ func (p *parser) node(kind int) *node {
 func (p *parser) document() *node {
 	n := p.node(documentNode)
 	n.anchors = make(map[string]*node)
+	n.value = p.predoc()
 	p.doc = n
 	p.expect(yaml_DOCUMENT_START_EVENT)
-	n.children = append(n.children, p.parse())
+	next := p.parse()
+
+	// Append post-document comments
+	next.children = append(next.children, p.comments...)
+
+	n.children = append(n.children, next)
 	p.expect(yaml_DOCUMENT_END_EVENT)
+	return n
+}
+
+func (p *parser) emptydocument() *node {
+	if !p.parser.parse_comments {
+		return nil
+	}
+	n := p.node(documentNode)
+	n.value = p.predoc()
+
 	return n
 }
 
@@ -198,13 +223,25 @@ func (p *parser) scalar() *node {
 	return n
 }
 
+func (p *parser) comment() *node {
+	n := p.node(commentNode)
+	n.value = string(p.event.value)
+	p.expect(yaml_COMMENT_EVENT)
+	return n
+}
+
+func (p *parser) eolcomment() *node {
+	n := p.node(eolCommentNode)
+	n.value = string(p.event.value)
+	p.expect(yaml_EOL_COMMENT_EVENT)
+	return n
+}
+
 func (p *parser) sequence() *node {
 	n := p.node(sequenceNode)
 	p.anchor(n, p.event.anchor)
 	p.expect(yaml_SEQUENCE_START_EVENT)
-	for p.peek() != yaml_SEQUENCE_END_EVENT {
-		n.children = append(n.children, p.parse())
-	}
+	p.parseChildren(yaml_SEQUENCE_END_EVENT, n)
 	p.expect(yaml_SEQUENCE_END_EVENT)
 	return n
 }
@@ -213,31 +250,68 @@ func (p *parser) mapping() *node {
 	n := p.node(mappingNode)
 	p.anchor(n, p.event.anchor)
 	p.expect(yaml_MAPPING_START_EVENT)
-	for p.peek() != yaml_MAPPING_END_EVENT {
-		n.children = append(n.children, p.parse(), p.parse())
-	}
+	p.parseChildren(yaml_MAPPING_END_EVENT, n)
 	p.expect(yaml_MAPPING_END_EVENT)
 	return n
+}
+
+func (p *parser) parseChildren(event yaml_event_type_t, n *node) {
+	for p.peek() != event {
+		next := p.parse()
+
+		// Make sure comment nodes have the same parent as the following non-comment node
+		if next.kind == commentNode {
+			p.comments = append(p.comments, next)
+			continue
+		}
+
+		// If a sequence has an end-of-line comment, convert it to a normal comment preceding the sequence
+		l := len(n.children)
+		if next.kind == eolCommentNode && l > 0 && n.children[l-1].kind == sequenceNode {
+			next.kind = commentNode
+			n.children = append(n.children, next)
+			n.children[l], n.children[l-1] = n.children[l-1], n.children[l]
+			continue
+		}
+
+		if next.kind == scalarNode {
+			n.children = append(n.children, p.comments...)
+			p.comments = []*node{}
+		}
+
+		n.children = append(n.children, next)
+	}
+}
+
+func (p *parser) predoc() string {
+	str := string(p.parser.predoc)
+	if p.parser.parse_comments && len(str) > 0 && str[len(str)-1] == '\n' {
+		// Remove extraneous newline
+		str = str[:len(str)-1]
+	}
+	return str
 }
 
 // ----------------------------------------------------------------------------
 // Decoder, unmarshals a node into a provided value.
 
 type decoder struct {
-	doc     *node
-	aliases map[*node]bool
-	mapType reflect.Type
-	terrors []string
-	strict  bool
+	doc      *node
+	aliases  map[*node]bool
+	mapType  reflect.Type
+	terrors  []string
+	strict   bool
+	comments bool
 }
 
 var (
-	mapItemType    = reflect.TypeOf(MapItem{})
-	durationType   = reflect.TypeOf(time.Duration(0))
-	defaultMapType = reflect.TypeOf(map[interface{}]interface{}{})
-	ifaceType      = defaultMapType.Elem()
-	timeType       = reflect.TypeOf(time.Time{})
-	ptrTimeType    = reflect.TypeOf(&time.Time{})
+	mapItemType      = reflect.TypeOf(MapItem{})
+	sequenceItemType = reflect.TypeOf(SequenceItem{})
+	durationType     = reflect.TypeOf(time.Duration(0))
+	defaultMapType   = reflect.TypeOf(map[interface{}]interface{}{})
+	ifaceType        = defaultMapType.Elem()
+	timeType         = reflect.TypeOf(time.Time{})
+	ptrTimeType      = reflect.TypeOf(&time.Time{})
 )
 
 func newDecoder(strict bool) *decoder {
@@ -339,9 +413,22 @@ func (d *decoder) unmarshal(n *node, out reflect.Value) (good bool) {
 }
 
 func (d *decoder) document(n *node, out reflect.Value) (good bool) {
-	if len(n.children) == 1 {
-		d.doc = n
-		d.unmarshal(n.children[0], out)
+	if len(n.children) == 1 || len(n.children) == 0 {
+		if len(n.children) == 1 {
+			d.doc = n
+			d.unmarshal(n.children[0], out)
+		}
+
+		// If there is a PreDoc string, insert it as the first child
+		if _, ok := out.Interface().(MapSlice); len(strings.TrimSpace(n.value)) > 0 && ok {
+			slice := reflect.ValueOf(MapSlice{
+				MapItem{
+					Key:   PreDoc(n.value),
+					Value: nil,
+				},
+			})
+			out.Set(reflect.AppendSlice(slice, out))
+		}
 		return true
 	}
 	return false
@@ -429,7 +516,7 @@ func (d *decoder) scalar(n *node, out reflect.Value) bool {
 	case reflect.Interface:
 		if resolved == nil {
 			out.Set(reflect.Zero(out.Type()))
-		} else if tag == yaml_TIMESTAMP_TAG {
+		} else if tag == yaml_TIMESTAMP_TAG && !d.comments {
 			// It looks like a timestamp but for backward compatibility
 			// reasons we set it as a string, so that code that unmarshals
 			// timestamp-like values into interface{} will continue to
@@ -541,8 +628,12 @@ func settableValueOf(i interface{}) reflect.Value {
 }
 
 func (d *decoder) sequence(n *node, out reflect.Value) (good bool) {
-	l := len(n.children)
+	if d.comments {
+		d.sequenceStruct(n, out)
+		return true
+	}
 
+	l := len(n.children)
 	var iface reflect.Value
 	switch out.Kind() {
 	case reflect.Slice:
@@ -576,6 +667,34 @@ func (d *decoder) sequence(n *node, out reflect.Value) (good bool) {
 		iface.Set(out)
 	}
 	return true
+}
+
+func (d *decoder) sequenceStruct(n *node, out reflect.Value) {
+	l := len(n.children)
+	var slice []SequenceItem
+	for i := 0; i < l; i++ {
+		child := n.children[i]
+		// Check for comment
+		if child.kind == commentNode {
+			item := SequenceItem{
+				Value:   nil,
+				Comment: child.value,
+			}
+			slice = append(slice, item)
+			continue
+		}
+		item := SequenceItem{}
+		v := reflect.ValueOf(&item.Value).Elem()
+		if ok := d.unmarshal(child, v); ok {
+			// Check for end-of-line comment
+			if i+1 < l && n.children[i+1].kind == eolCommentNode {
+				item.Comment = n.children[i+1].value
+				i++
+			}
+			slice = append(slice, item)
+		}
+	}
+	out.Set(reflect.ValueOf(slice))
 }
 
 func (d *decoder) mapping(n *node, out reflect.Value) (good bool) {
@@ -660,23 +779,130 @@ func (d *decoder) mappingSlice(n *node, out reflect.Value) (good bool) {
 
 	var slice []MapItem
 	var l = len(n.children)
-	for i := 0; i < l; i += 2 {
-		if isMerge(n.children[i]) {
-			d.merge(n.children[i+1], out)
+	var child *node
+	var key *node
+	var value *node
+	var keySet bool
+	var eolComment string
+	var comments []*node
+	for i := 0; i < l; i += 1 {
+		child = n.children[i]
+		if child.kind == commentNode {
+			// If keySet is true, the comment takes place between the key and the value. In this case, the comment(s)
+			// placement will depend on what the value is. If the value is primitive, the key and value will be
+			// placed onto the same line, and comments are concatenated and treated as a single end-of-line comment.
+			// If the value is not primitive, the comments should be treated the same as map or sequence items.
+			if keySet {
+				comments = append(comments, child)
+			} else {
+				commentItem := MapItem{
+					Key:     nil,
+					Value:   nil,
+					Comment: child.value,
+				}
+				slice = append(slice, commentItem)
+			}
 			continue
 		}
+
+		// Check for end-of-line comment after a key. Like a normal comment, its placement depends on the value.
+		// If the value is primitive, the key and value will be placed onto the same line and the comment follows
+		// the value. If there are also normal comments between the key and primitive value, the comments are
+		// concatenated. In this case, the key's end-of-line comment will appear first in the concatenated comment.
+		// If the value is not primitive, the comment is placed next to the key and the value on the next line.
+		if child.kind == eolCommentNode {
+			eolComment = child.value
+			continue
+		}
+
+		if !keySet {
+			keySet = true
+			key = child
+			continue
+		}
+
+		if isMerge(key) {
+			d.merge(child, out)
+			continue
+		}
+
+		keySet = false
+		value = child
+
 		item := MapItem{}
 		k := reflect.ValueOf(&item.Key).Elem()
-		if d.unmarshal(n.children[i], k) {
+		if d.unmarshal(key, k) {
 			v := reflect.ValueOf(&item.Value).Elem()
-			if d.unmarshal(n.children[i+1], v) {
+			if d.unmarshal(value, v) {
+				// If the value is basic (placed onto same line as the key), concatenate the comments and treat them
+				// as a single end-of-line comment, else print each comment on its own line.
+				if isBasicType(v, value.tag) {
+					for _, comment := range comments {
+						if len(eolComment) > 0 {
+							eolComment += ";"
+						}
+						eolComment += comment.value
+					}
+				} else {
+					for _, comment := range comments {
+						commentItem := MapItem{
+							Key:     nil,
+							Value:   nil,
+							Comment: comment.value,
+						}
+						slice = append(slice, commentItem)
+					}
+				}
+
+				// Check for end-of-line comment after the value
+				// When using explicit key and value it is possible to have an end-of-line comment for both the key and
+				// the value. By default, the key gets converted to a simple key. This concatenates the two comments
+				// into a single semicolon-separated end-of-line comment.
+				// eg.
+				//     ? key # c1
+				//     : value # c2
+				// becomes
+				//     key: value # c1; c2
+				if i+1 < l && n.children[i+1].kind == eolCommentNode {
+					if len(eolComment) > 0 {
+						eolComment += ";"
+					}
+					eolComment += n.children[i+1].value
+					i++
+				}
+				item.Comment = eolComment
 				slice = append(slice, item)
+				eolComment = ""
+				comments = []*node{}
 			}
 		}
+	}
+	for _, comment := range comments {
+		item := MapItem{
+			Key:     nil,
+			Value:   nil,
+			Comment: comment.value,
+		}
+		slice = append(slice, item)
 	}
 	out.Set(reflect.ValueOf(slice))
 	d.mapType = mapType
 	return true
+}
+
+// Returns true if the value would be placed onto the same line as its key following library defaults, or false if
+// it would be placed onto its own line
+func isBasicType(v reflect.Value, tag string) bool {
+	switch v.Interface().(type) {
+	case int, bool:
+		return true
+	case string:
+		if style, _, _ := getScalarStyle(tag, v, v.String()); style != yaml_LITERAL_SCALAR_STYLE {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (d *decoder) mappingStruct(n *node, out reflect.Value) (good bool) {

@@ -160,8 +160,11 @@ func (e *encoder) marshal(tag string, in reflect.Value) {
 			e.structv(tag, in)
 		}
 	case reflect.Slice, reflect.Array:
-		if in.Type().Elem() == mapItemType {
+		elemType := in.Type().Elem()
+		if elemType == mapItemType {
 			e.itemsv(tag, in)
+		} else if elemType == sequenceItemType {
+			e.sequenceitemv(tag, in)
 		} else {
 			e.slicev(tag, in)
 		}
@@ -199,8 +202,34 @@ func (e *encoder) itemsv(tag string, in reflect.Value) {
 	e.mappingv(tag, func() {
 		slice := in.Convert(reflect.TypeOf([]MapItem{})).Interface().([]MapItem)
 		for _, item := range slice {
+			// Check if it is pre-document string
+			if preDoc, ok := item.Key.(PreDoc); ok {
+				e.predocv(string(preDoc))
+				continue
+			}
+
+			// Check if it is a comment
+			if item.Key == nil && item.Value == nil && len(item.Comment) > 0 {
+				e.commentv([]byte(item.Comment))
+				continue
+			}
+
 			e.marshal("", reflect.ValueOf(item.Key))
-			e.marshal("", reflect.ValueOf(item.Value))
+
+			// If the value is a primitive value (eg. string, int), an end-of-line comment should follow the value,
+			// else it should follow the key. Note that empty end-of-line comments are ignored.
+			switch item.Value.(type) {
+			case string, int, bool:
+				e.marshal("", reflect.ValueOf(item.Value))
+				if len(item.Comment) > 0 {
+					e.eolcommentv([]byte(item.Comment))
+				}
+			default:
+				if len(item.Comment) > 0 {
+					e.eolcommentv([]byte(item.Comment))
+				}
+				e.marshal("", reflect.ValueOf(item.Value))
+			}
 		}
 	})
 }
@@ -259,6 +288,35 @@ func (e *encoder) mappingv(tag string, f func()) {
 }
 
 func (e *encoder) slicev(tag string, in reflect.Value) {
+	e.sequencev(tag, func() {
+		n := in.Len()
+		for i := 0; i < n; i++ {
+			e.marshal("", in.Index(i))
+		}
+	})
+}
+
+func (e *encoder) sequenceitemv(tag string, in reflect.Value) {
+	e.sequencev(tag, func() {
+		slice := in.Interface().([]SequenceItem)
+		for _, item := range slice {
+			// Check if it is a comment
+			if item.Value == nil && len(item.Comment) > 0 {
+				e.commentv([]byte(item.Comment))
+				continue
+			}
+
+			e.marshal("", reflect.ValueOf(item.Value))
+
+			// Note that empty end-of-line comments are ignored
+			if len(item.Comment) > 0 {
+				e.eolcommentv([]byte(item.Comment))
+			}
+		}
+	})
+}
+
+func (e *encoder) sequencev(tag string, f func()) {
 	implicit := tag == ""
 	style := yaml_BLOCK_SEQUENCE_STYLE
 	if e.flow {
@@ -267,10 +325,7 @@ func (e *encoder) slicev(tag string, in reflect.Value) {
 	}
 	e.must(yaml_sequence_start_event_initialize(&e.event, nil, []byte(tag), implicit, style))
 	e.emit()
-	n := in.Len()
-	for i := 0; i < n; i++ {
-		e.marshal("", in.Index(i))
-	}
+	f()
 	e.must(yaml_sequence_end_event_initialize(&e.event))
 	e.emit()
 }
@@ -298,8 +353,12 @@ func isBase60Float(s string) (result bool) {
 var base60float = regexp.MustCompile(`^[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+(?:\.[0-9_]*)?$`)
 
 func (e *encoder) stringv(tag string, in reflect.Value) {
+	style, tag, s := getScalarStyle(tag, in, in.String())
+	e.emitScalar(s, "", tag, style)
+}
+
+func getScalarStyle(tag string, in reflect.Value, s string) (yaml_scalar_style_t, string, string) {
 	var style yaml_scalar_style_t
-	s := in.String()
 	canUsePlain := true
 	switch {
 	case !utf8.ValidString(s):
@@ -331,7 +390,8 @@ func (e *encoder) stringv(tag string, in reflect.Value) {
 	default:
 		style = yaml_DOUBLE_QUOTED_SCALAR_STYLE
 	}
-	e.emitScalar(s, "", tag, style)
+
+	return style, tag, s
 }
 
 func (e *encoder) boolv(tag string, in reflect.Value) {
@@ -381,6 +441,21 @@ func (e *encoder) floatv(tag string, in reflect.Value) {
 
 func (e *encoder) nilv() {
 	e.emitScalar("null", "", "", yaml_PLAIN_SCALAR_STYLE)
+}
+
+func (e *encoder) commentv(value []byte) {
+	yaml_comment_event_initialize(&e.event, value)
+	e.emit()
+}
+
+func (e *encoder) eolcommentv(value []byte) {
+	yaml_eol_comment_event_initialize(&e.event, value)
+	e.emit()
+}
+
+func (e *encoder) predocv(value string) {
+	yaml_predoc_event_initialize(&e.event, []byte(value))
+	e.emit()
 }
 
 func (e *encoder) emitScalar(value, anchor, tag string, style yaml_scalar_style_t) {

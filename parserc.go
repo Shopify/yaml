@@ -213,6 +213,14 @@ func yaml_parser_parse_document_start(parser *yaml_parser_t, event *yaml_event_t
 		}
 	}
 
+	// Skip comments at the top of the file since these are valid for both implicit and explicit documents and thus
+	// prevent the following logic from deciding whether the document is implicit or explicit
+	token = peek_token(parser)
+	for token.typ == yaml_COMMENT_TOKEN {
+		skip_token(parser)
+		token = peek_token(parser)
+	}
+
 	if implicit && token.typ != yaml_VERSION_DIRECTIVE_TOKEN &&
 		token.typ != yaml_TAG_DIRECTIVE_TOKEN &&
 		token.typ != yaml_DOCUMENT_START_TOKEN &&
@@ -260,6 +268,13 @@ func yaml_parser_parse_document_start(parser *yaml_parser_t, event *yaml_event_t
 			implicit:          false,
 		}
 		skip_token(parser)
+
+		// Skip comments between the document start and the yaml data
+		token = peek_token(parser)
+		for token.typ == yaml_COMMENT_TOKEN {
+			skip_token(parser)
+			token = peek_token(parser)
+		}
 
 	} else {
 		// Parse the stream end.
@@ -546,6 +561,9 @@ func yaml_parser_parse_node(parser *yaml_parser_t, event *yaml_event_t, block, i
 		}
 		return true
 	}
+	if token.typ == yaml_COMMENT_TOKEN || token.typ == yaml_EOL_COMMENT_TOKEN {
+		return yaml_parser_parse_comment(parser, event, token)
+	}
 	if len(anchor) > 0 || len(tag) > 0 {
 		parser.state = parser.states[len(parser.states)-1]
 		parser.states = parser.states[:len(parser.states)-1]
@@ -616,6 +634,8 @@ func yaml_parser_parse_block_sequence_entry(parser *yaml_parser_t, event *yaml_e
 
 		skip_token(parser)
 		return true
+	} else if token.typ == yaml_COMMENT_TOKEN || token.typ == yaml_EOL_COMMENT_TOKEN {
+		return yaml_parser_parse_comment(parser, event, token)
 	}
 
 	context_mark := parser.marks[len(parser.marks)-1]
@@ -634,6 +654,9 @@ func yaml_parser_parse_indentless_sequence_entry(parser *yaml_parser_t, event *y
 		return false
 	}
 
+	if token.typ == yaml_COMMENT_TOKEN || token.typ == yaml_EOL_COMMENT_TOKEN {
+		return yaml_parser_parse_comment(parser, event, token)
+	}
 	if token.typ == yaml_BLOCK_ENTRY_TOKEN {
 		mark := token.end_mark
 		skip_token(parser)
@@ -711,6 +734,8 @@ func yaml_parser_parse_block_mapping_key(parser *yaml_parser_t, event *yaml_even
 		}
 		skip_token(parser)
 		return true
+	} else if token.typ == yaml_COMMENT_TOKEN || token.typ == yaml_EOL_COMMENT_TOKEN {
+		return yaml_parser_parse_comment(parser, event, token)
 	}
 
 	context_mark := parser.marks[len(parser.marks)-1]
@@ -735,12 +760,36 @@ func yaml_parser_parse_block_mapping_value(parser *yaml_parser_t, event *yaml_ev
 	if token == nil {
 		return false
 	}
+	if token.typ == yaml_EOL_COMMENT_TOKEN {
+		return yaml_parser_parse_comment(parser, event, token)
+	}
 	if token.typ == yaml_VALUE_TOKEN {
 		mark := token.end_mark
 		skip_token(parser)
+		oldToken := token
 		token = peek_token(parser)
 		if token == nil {
 			return false
+		}
+		if token.typ == yaml_COMMENT_TOKEN || token.typ == yaml_EOL_COMMENT_TOKEN {
+			var eventTyp yaml_event_type_t
+			switch token.typ {
+			case yaml_COMMENT_TOKEN:
+				eventTyp = yaml_COMMENT_EVENT
+			case yaml_EOL_COMMENT_TOKEN:
+				eventTyp = yaml_EOL_COMMENT_EVENT
+			}
+			*event = yaml_event_t{
+				typ:        eventTyp,
+				value:      token.value,
+				start_mark: token.start_mark,
+				end_mark:   token.end_mark,
+			}
+			// Reset the current token to the value token. After this, this function is going to be called again, and
+			// we need the first token in the queue to be a VALUE token. A COMMENT token is not a real value, so we
+			// essentially "skip" it.
+			parser.tokens[parser.tokens_head] = *oldToken
+			return true
 		}
 		if token.typ != yaml_KEY_TOKEN &&
 			token.typ != yaml_VALUE_TOKEN &&
@@ -1022,7 +1071,9 @@ func yaml_parser_process_directives(parser *yaml_parser_t,
 		return false
 	}
 
-	for token.typ == yaml_VERSION_DIRECTIVE_TOKEN || token.typ == yaml_TAG_DIRECTIVE_TOKEN {
+	for token.typ == yaml_VERSION_DIRECTIVE_TOKEN ||
+		token.typ == yaml_TAG_DIRECTIVE_TOKEN ||
+		token.typ == yaml_COMMENT_TOKEN {
 		if token.typ == yaml_VERSION_DIRECTIVE_TOKEN {
 			if version_directive != nil {
 				yaml_parser_set_parser_error(parser,
@@ -1091,5 +1142,25 @@ func yaml_parser_append_tag_directive(parser *yaml_parser_t, value yaml_tag_dire
 	copy(value_copy.handle, value.handle)
 	copy(value_copy.prefix, value.prefix)
 	parser.tag_directives = append(parser.tag_directives, value_copy)
+	return true
+}
+
+func yaml_parser_parse_comment(parser *yaml_parser_t, event *yaml_event_t, token *yaml_token_t) bool {
+	var eventTyp yaml_event_type_t
+	switch token.typ {
+	case yaml_COMMENT_TOKEN:
+		eventTyp = yaml_COMMENT_EVENT
+	case yaml_EOL_COMMENT_TOKEN:
+		eventTyp = yaml_EOL_COMMENT_EVENT
+	default:
+		return false
+	}
+	*event = yaml_event_t{
+		typ:        eventTyp,
+		value:      token.value,
+		start_mark: token.start_mark,
+		end_mark:   token.end_mark,
+	}
+	skip_token(parser)
 	return true
 }

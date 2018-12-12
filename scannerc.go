@@ -487,27 +487,38 @@ func cache(parser *yaml_parser_t, length int) bool {
 	return parser.unread >= length || yaml_parser_update_buffer(parser, length)
 }
 
+func copy_to_predoc(parser *yaml_parser_t, data ...byte) {
+	if !parser.doc_started {
+		parser.predoc = append(parser.predoc, data...)
+	}
+}
+
 // Advance the buffer pointer.
 func skip(parser *yaml_parser_t) {
+	width := width(parser.buffer[parser.buffer_pos])
+	copy_to_predoc(parser, parser.buffer[parser.buffer_pos:parser.buffer_pos+width]...)
 	parser.mark.index++
 	parser.mark.column++
 	parser.unread--
-	parser.buffer_pos += width(parser.buffer[parser.buffer_pos])
+	parser.buffer_pos += width
 }
 
 func skip_line(parser *yaml_parser_t) {
 	if is_crlf(parser.buffer, parser.buffer_pos) {
+		copy_to_predoc(parser, parser.buffer[parser.buffer_pos:parser.buffer_pos+2]...)
 		parser.mark.index += 2
 		parser.mark.column = 0
 		parser.mark.line++
 		parser.unread -= 2
 		parser.buffer_pos += 2
 	} else if is_break(parser.buffer, parser.buffer_pos) {
+		width := width(parser.buffer[parser.buffer_pos])
+		copy_to_predoc(parser, parser.buffer[parser.buffer_pos:parser.buffer_pos+width]...)
 		parser.mark.index++
 		parser.mark.column = 0
 		parser.mark.line++
 		parser.unread--
-		parser.buffer_pos += width(parser.buffer[parser.buffer_pos])
+		parser.buffer_pos += width
 	}
 }
 
@@ -521,10 +532,12 @@ func read(parser *yaml_parser_t, s []byte) []byte {
 		s = make([]byte, 0, 32)
 	}
 	if w == 1 && len(s)+w <= cap(s) {
+		copy_to_predoc(parser, parser.buffer[parser.buffer_pos])
 		s = s[:len(s)+1]
 		s[len(s)-1] = parser.buffer[parser.buffer_pos]
 		parser.buffer_pos++
 	} else {
+		copy_to_predoc(parser, parser.buffer[parser.buffer_pos:parser.buffer_pos+w]...)
 		s = append(s, parser.buffer[parser.buffer_pos:parser.buffer_pos+w]...)
 		parser.buffer_pos += w
 	}
@@ -541,20 +554,27 @@ func read_line(parser *yaml_parser_t, s []byte) []byte {
 	switch {
 	case buf[pos] == '\r' && buf[pos+1] == '\n':
 		// CR LF . LF
-		s = append(s, '\n')
+		var c byte = '\n'
+		copy_to_predoc(parser, c)
+		s = append(s, c)
 		parser.buffer_pos += 2
 		parser.mark.index++
 		parser.unread--
 	case buf[pos] == '\r' || buf[pos] == '\n':
 		// CR|LF . LF
-		s = append(s, '\n')
+		var c byte = '\n'
+		copy_to_predoc(parser, c)
+		s = append(s, c)
 		parser.buffer_pos += 1
 	case buf[pos] == '\xC2' && buf[pos+1] == '\x85':
 		// NEL . LF
-		s = append(s, '\n')
+		var c byte = '\n'
+		copy_to_predoc(parser, c)
+		s = append(s, c)
 		parser.buffer_pos += 2
 	case buf[pos] == '\xE2' && buf[pos+1] == '\x80' && (buf[pos+2] == '\xA8' || buf[pos+2] == '\xA9'):
 		// LS|PS . LS|PS
+		copy_to_predoc(parser, buf[parser.buffer_pos:pos+3]...)
 		s = append(s, buf[parser.buffer_pos:pos+3]...)
 		parser.buffer_pos += 3
 	default:
@@ -673,7 +693,7 @@ func yaml_parser_fetch_next_token(parser *yaml_parser_t) bool {
 		return yaml_parser_fetch_stream_start(parser)
 	}
 
-	// Eat whitespaces and comments until we reach the next token.
+	// Eat whitespaces until we reach the next token or a comment.
 	if !yaml_parser_scan_to_next_token(parser) {
 		return false
 	}
@@ -683,9 +703,11 @@ func yaml_parser_fetch_next_token(parser *yaml_parser_t) bool {
 		return false
 	}
 
-	// Check the indentation level against the current column.
-	if !yaml_parser_unroll_indent(parser, parser.mark.column) {
-		return false
+	// Check the indentation level against the current column, only if the current token is not a comment
+	if parser.buffer[parser.buffer_pos] != '#' {
+		if !yaml_parser_unroll_indent(parser, parser.mark.column) {
+			return false
+		}
 	}
 
 	// Ensure that the buffer contains at least 4 characters.  4 is the length
@@ -716,6 +738,16 @@ func yaml_parser_fetch_next_token(parser *yaml_parser_t) bool {
 	if parser.mark.column == 0 && buf[pos] == '.' && buf[pos+1] == '.' && buf[pos+2] == '.' && is_blankz(buf, pos+3) {
 		return yaml_parser_fetch_document_indicator(parser, yaml_DOCUMENT_END_TOKEN)
 	}
+
+	// Is it a comment?
+	if parser.buffer[parser.buffer_pos] == '#' {
+		return yaml_parser_fetch_comment(parser)
+	}
+
+	// It is yaml data (not a newline, comment, directive, or document start / end)
+	parser.doc_started = true
+
+	parser.eol_comment_possible = true
 
 	// Is it the flow sequence start indicator?
 	if buf[pos] == '[' {
@@ -835,6 +867,34 @@ func yaml_parser_fetch_next_token(parser *yaml_parser_t) bool {
 	return yaml_parser_set_scanner_error(parser,
 		"while scanning for the next token", parser.mark,
 		"found character that cannot start any token")
+}
+
+func yaml_parser_fetch_comment(parser *yaml_parser_t) bool {
+	start_mark := parser.mark
+	var comment []byte
+	// Skip # character
+	skip(parser)
+	for !is_breakz(parser.buffer, parser.buffer_pos) {
+		comment = read(parser, comment)
+		if parser.unread < 1 && !yaml_parser_update_buffer(parser, 1) {
+			return false
+		}
+	}
+	typ := yaml_COMMENT_TOKEN
+	if parser.eol_comment_possible {
+		typ = yaml_EOL_COMMENT_TOKEN
+	}
+	token := yaml_token_t{
+		typ:        typ,
+		start_mark: start_mark,
+		end_mark:   parser.mark,
+		value:      comment,
+		style:      yaml_PLAIN_SCALAR_STYLE,
+	}
+	if parser.parse_comments {
+		yaml_insert_token(parser, -1, &token)
+	}
+	return true
 }
 
 // Check the list of potential simple keys and remove the positions that
@@ -1453,18 +1513,9 @@ func yaml_parser_scan_to_next_token(parser *yaml_parser_t) bool {
 			}
 		}
 
-		// Eat a comment until a line break.
-		if parser.buffer[parser.buffer_pos] == '#' {
-			for !is_breakz(parser.buffer, parser.buffer_pos) {
-				skip(parser)
-				if parser.unread < 1 && !yaml_parser_update_buffer(parser, 1) {
-					return false
-				}
-			}
-		}
-
 		// If it is a line break, eat it.
 		if is_break(parser.buffer, parser.buffer_pos) {
+			parser.eol_comment_possible = false
 			if parser.unread < 2 && !yaml_parser_update_buffer(parser, 2) {
 				return false
 			}
@@ -2494,6 +2545,7 @@ func yaml_parser_scan_flow_scalar(parser *yaml_parser_t, token *yaml_token_t, si
 					skip(parser)
 				}
 			} else {
+				parser.eol_comment_possible = false
 				if parser.unread < 2 && !yaml_parser_update_buffer(parser, 2) {
 					return false
 				}
@@ -2553,7 +2605,6 @@ func yaml_parser_scan_flow_scalar(parser *yaml_parser_t, token *yaml_token_t, si
 
 // Scan a plain scalar.
 func yaml_parser_scan_plain_scalar(parser *yaml_parser_t, token *yaml_token_t) bool {
-
 	var s, leading_break, trailing_breaks, whitespaces []byte
 	var leading_blanks bool
 	var indent = parser.indent + 1
@@ -2655,6 +2706,7 @@ func yaml_parser_scan_plain_scalar(parser *yaml_parser_t, token *yaml_token_t) b
 					skip(parser)
 				}
 			} else {
+				parser.eol_comment_possible = false
 				if parser.unread < 2 && !yaml_parser_update_buffer(parser, 2) {
 					return false
 				}

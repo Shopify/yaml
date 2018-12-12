@@ -22,7 +22,16 @@ type MapSlice []MapItem
 // MapItem is an item in a MapSlice.
 type MapItem struct {
 	Key, Value interface{}
+	Comment    string
 }
+
+// SequenceItem is an item in a sequence
+type SequenceItem struct {
+	Value   interface{}
+	Comment string
+}
+
+type PreDoc string
 
 // The Unmarshaler interface may be implemented by types to customize their
 // behavior when being unmarshaled from a YAML document. The UnmarshalYAML
@@ -78,7 +87,7 @@ type Marshaler interface {
 // supported tag options.
 //
 func Unmarshal(in []byte, out interface{}) (err error) {
-	return unmarshal(in, out, false)
+	return unmarshal(in, out, false, false)
 }
 
 // UnmarshalStrict is like Unmarshal except that any fields that are found
@@ -86,7 +95,15 @@ func Unmarshal(in []byte, out interface{}) (err error) {
 // keys that are duplicates, will result in
 // an error.
 func UnmarshalStrict(in []byte, out interface{}) (err error) {
-	return unmarshal(in, out, true)
+	return unmarshal(in, out, true, false)
+}
+
+// CommentUnmarshal is like Unmarshal except with added support for comments.
+// No assumptions are made about what data a comment should be tied to, so maps
+// are represented using MapSlice objects which maintain the order of map items.
+func CommentUnmarshal(in []byte) (MapSlice, error) {
+	out := MapSlice{}
+	return out, unmarshal(in, &out, false, true)
 }
 
 // A Decorder reads and decodes YAML values from an input stream.
@@ -134,10 +151,12 @@ func (dec *Decoder) Decode(v interface{}) (err error) {
 	return nil
 }
 
-func unmarshal(in []byte, out interface{}, strict bool) (err error) {
+func unmarshal(in []byte, out interface{}, strict bool, parse_comments bool) (err error) {
 	defer handleErr(&err)
 	d := newDecoder(strict)
+	d.comments = parse_comments
 	p := newParser(in)
+	p.parser.parse_comments = parse_comments
 	defer p.destroy()
 	node := p.parse()
 	if node != nil {
