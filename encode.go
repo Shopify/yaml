@@ -41,6 +41,7 @@ func newEncoder() *encoder {
 	yaml_emitter_initialize(&e.emitter)
 	yaml_emitter_set_output_string(&e.emitter, &e.out)
 	yaml_emitter_set_unicode(&e.emitter, true)
+	yaml_emitter_set_width(&e.emitter, -1)
 	return e
 }
 
@@ -49,6 +50,7 @@ func newEncoderWithWriter(w io.Writer) *encoder {
 	yaml_emitter_initialize(&e.emitter)
 	yaml_emitter_set_output_writer(&e.emitter, w)
 	yaml_emitter_set_unicode(&e.emitter, true)
+	yaml_emitter_set_width(&e.emitter, -1)
 	return e
 }
 
