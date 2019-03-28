@@ -218,6 +218,7 @@ func unmarshal(in []byte, out interface{}, strict bool, parse_comments bool) (er
 func Marshal(in interface{}) (out []byte, err error) {
 	defer handleErr(&err)
 	e := newEncoder()
+	e.SetLineWidth(-1)
 	defer e.destroy()
 	e.marshalDoc("", reflect.ValueOf(in))
 	e.finish()
@@ -237,6 +238,13 @@ func NewEncoder(w io.Writer) *Encoder {
 	return &Encoder{
 		encoder: newEncoderWithWriter(w),
 	}
+}
+
+// SetLineWidth sets the preferred line width.
+// To disable long line breaks set width lower than zero.
+// By default, line width is set to 80.
+func (e *Encoder) SetLineWidth(width int) {
+	e.encoder.setWidth(width)
 }
 
 // Encode writes the YAML encoding of v to the stream.
