@@ -308,6 +308,26 @@ func (e *encoder) sequenceitemv(tag string, in reflect.Value) {
 				continue
 			}
 
+			// Check if the value is a MapSlice
+			if reflect.TypeOf(item.Value) == reflect.TypeOf(MapSlice{}) {
+				itemSlice := item.Value.(MapSlice)
+				endIndex := 0
+				
+				for index, subItem := range itemSlice {
+					endIndex = index
+					
+					// check if the value is a comment
+					if subItem.Value == nil && len(subItem.Comment) > 0 {
+						// If the subitem is a comment, add it before beginning the sequence
+						e.commentv([]byte(subItem.Comment))
+					} else {
+						break
+					} 
+				}
+				// remove all comments to avoid double printing
+				item.Value = itemSlice[endIndex:len(itemSlice)]
+			}
+
 			e.marshal("", reflect.ValueOf(item.Value))
 
 			// Note that empty end-of-line comments are ignored
