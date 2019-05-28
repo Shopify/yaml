@@ -402,6 +402,27 @@ var marshalTests = []struct {
 		},
 		"a:\n  b:\n  # my comment\n  - 3\n  # my comment 2\n  - 8\n",
 	},
+	{ // sequence containing mapitems preceded by comments
+		&yaml.MapSlice{
+			{Key: "a", Value: yaml.MapSlice{
+				{Key: "b", Value: []yaml.SequenceItem{
+					{Value: yaml.MapSlice{
+						{Key: nil, Value: nil, Comment: " my comment"},
+						{Key: nil, Value: nil, Comment: " my comment 2"},
+						{Key: "a", Value: 3, Comment: ""},
+						{Key: "b", Value: 7, Comment: ""},
+						{Key: nil, Value: nil, Comment: " my comment 3"},
+					}, Comment: ""},
+					{Value: yaml.MapSlice{
+						{Key: nil, Value: nil, Comment: " my comment 4"},
+						{Key: "a", Value: 9, Comment: ""},
+						{Key: "b", Value: 2, Comment: ""},
+					}, Comment: ""},
+				}, Comment: ""},
+			}, Comment: ""},
+		},
+		"a:\n  b:\n  # my comment\n  # my comment 2\n  - a: 3\n    b: 7\n    # my comment 3\n  # my comment 4\n  - a: 9\n    b: 2\n",
+	},
 	{ // key comment (non-primitive value)
 		&yaml.MapSlice{
 			{Key: "a", Value: yaml.MapSlice{
